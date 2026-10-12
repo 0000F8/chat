@@ -33,6 +33,7 @@ import type {
   Adapter,
   AdapterPostableMessage,
   Attachment,
+  Author,
   ChannelInfo,
   ChatInstance,
   EmojiValue,
@@ -102,6 +103,7 @@ interface ActionSubmitData {
 
 const MESSAGEID_CAPTURE_PATTERN = /messageid=(\d+)/;
 const MESSAGEID_STRIP_PATTERN = /;messageid=\d+/;
+const BOT_USER_ID_PREFIX = "28:";
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const USER_INFO_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const USER_INFO_NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -559,13 +561,16 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     const threadId = this.threadIdFromActivity(activity);
 
     const message = this.parseTeamsMessage(activity, threadId);
-    const user = activity.from?.aadObjectId
-      ? await this.getIncomingUser(
-          ctx,
-          message.author.userId,
-          activity.from.aadObjectId
-        )
-      : await this.getUser(message.author.userId);
+    let user: UserInfo | null = null;
+    if (activity.from?.aadObjectId) {
+      user = await this.getIncomingUser(
+        ctx,
+        message.author.userId,
+        activity.from.aadObjectId
+      );
+    } else if (!message.author.isBot) {
+      user = await this.getUser(message.author.userId);
+    }
     if (user?.email) {
       message.author.email = user.email;
     }
@@ -648,13 +653,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     } = {
       actionId: actionValue.actionId,
       value: actionValue.value,
-      user: {
-        userId: activity.from?.id || "unknown",
-        userName: activity.from?.name || "unknown",
-        fullName: activity.from?.name || "unknown",
-        isBot: false,
-        isMe: false,
-      },
+      user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
       adapter: this,
@@ -708,13 +707,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     } = {
       actionId: actionData.actionId,
       value: actionData.value,
-      user: {
-        userId: activity.from?.id || "unknown",
-        userName: activity.from?.name || "unknown",
-        fullName: activity.from?.name || "unknown",
-        isBot: false,
-        isMe: false,
-      },
+      user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
       adapter: this,
@@ -759,13 +752,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     });
 
     const baseEvent = {
-      user: {
-        userId: activity.from?.id || "unknown",
-        userName: activity.from?.name || "unknown",
-        fullName: activity.from?.name || "unknown",
-        isBot: false,
-        isMe: false,
-      },
+      user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
       adapter: this as TeamsAdapter,
@@ -816,13 +803,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     } = {
       actionId: actionData.actionId || "dialog.open",
       value: actionData.value,
-      user: {
-        userId: activity.from?.id || "unknown",
-        userName: activity.from?.name || "unknown",
-        fullName: activity.from?.name || "unknown",
-        isBot: false,
-        isMe: false,
-      },
+      user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
       adapter: this,
@@ -910,13 +891,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
       viewId: activity.id || "",
       values,
       privateMetadata: undefined,
-      user: {
-        userId: activity.from?.id || "unknown",
-        userName: activity.from?.name || "unknown",
-        fullName: activity.from?.name || "unknown",
-        isBot: false,
-        isMe: false,
-      },
+      user: this.authorFromActivity(activity),
       adapter: this,
       raw: activity,
     };
@@ -951,13 +926,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
 
     const threadId = this.threadIdFromActivity(activity);
 
-    const user = {
-      userId: activity.from?.id || "unknown",
-      userName: activity.from?.name || "unknown",
-      fullName: activity.from?.name || "unknown",
-      isBot: false,
-      isMe: this.isMessageFromSelf(activity),
-    };
+    const user = this.authorFromActivity(activity);
 
     const reactionsAdded = activity.reactionsAdded || [];
     for (const reaction of reactionsAdded) {
@@ -1021,21 +990,13 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     const text = (activity as IMessageActivity).text || "";
     const normalizedText = this.normalizeMentions(text);
 
-    const isMe = this.isMessageFromSelf(activity);
-
     return new Message({
       id: activity.id || "",
       threadId,
       text: this.formatConverter.extractPlainText(normalizedText),
       formatted: this.formatConverter.toAst(normalizedText),
       raw: activity,
-      author: {
-        userId: activity.from?.id || "unknown",
-        userName: activity.from?.name || "unknown",
-        fullName: activity.from?.name || "unknown",
-        isBot: false, // TeamsSDK doesn't expose role directly; we check isMe instead
-        isMe,
-      },
+      author: this.authorFromActivity(activity),
       metadata: {
         dateSent: activity.timestamp
           ? new Date(activity.timestamp)
@@ -1170,9 +1131,10 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     aadObjectId: string
   ): Promise<UserInfo | null> {
     const cacheKey = `teams:userInfo:${aadObjectId}`;
+    const isBot = this.isBotSender(ctx.activity);
     const cached = await this.readCachedUserInfo(cacheKey);
     if (cached && cached !== USER_INFO_NEGATIVE_SENTINEL) {
-      return { ...cached, userId };
+      return { ...cached, isBot, userId };
     }
 
     try {
@@ -1184,7 +1146,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
         avatarUrl: undefined,
         email: member.email ?? member.userPrincipalName ?? undefined,
         fullName: member.name ?? aadObjectId,
-        isBot: false,
+        isBot,
         userId,
         userName:
           member.userPrincipalName ?? member.email ?? member.name ?? userId,
@@ -1208,12 +1170,13 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     aadObjectId: string
   ): Promise<UserInfo | null> {
     const cacheKey = `teams:userInfo:${aadObjectId}`;
+    const isBot = this.isBotUserId(userId);
     const cached = await this.readCachedUserInfo(cacheKey);
     if (cached === USER_INFO_NEGATIVE_SENTINEL) {
       return null;
     }
     if (cached) {
-      return { ...cached, userId };
+      return { ...cached, isBot, userId };
     }
 
     try {
@@ -1225,7 +1188,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
         avatarUrl: undefined,
         email: graphUser.mail ?? graphUser.userPrincipalName ?? undefined,
         fullName: graphUser.displayName ?? aadObjectId,
-        isBot: false,
+        isBot,
         userId,
         userName:
           graphUser.userPrincipalName ?? graphUser.displayName ?? userId,
@@ -2093,6 +2056,33 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
   protected isMessageFromSelf(activity: Activity): boolean {
     const fromId = activity.from?.id;
     return fromId ? this.isBotAccountId(fromId) : false;
+  }
+
+  /**
+   * Whether the sender is a bot: a sender with the Bot Framework `bot` role,
+   * or an account ID that {@link isBotUserId} recognizes.
+   */
+  protected isBotSender(activity: Activity): boolean {
+    const fromId = activity.from?.id;
+    return (
+      activity.from?.role?.toLowerCase() === "bot" ||
+      (fromId ? this.isBotUserId(fromId) : false)
+    );
+  }
+
+  /** Whether a Teams user ID is this bot or another bot account (`28:`). */
+  private isBotUserId(userId: string): boolean {
+    return userId.startsWith(BOT_USER_ID_PREFIX) || this.isBotAccountId(userId);
+  }
+
+  private authorFromActivity(activity: Activity): Author {
+    return {
+      userId: activity.from?.id || "unknown",
+      userName: activity.from?.name || "unknown",
+      fullName: activity.from?.name || "unknown",
+      isBot: this.isBotSender(activity),
+      isMe: this.isMessageFromSelf(activity),
+    };
   }
 
   /**
