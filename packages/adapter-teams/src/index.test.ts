@@ -2786,3 +2786,154 @@ describe("subclass extensibility", () => {
     expect(TestSubclass.prototype.checkAccess).toBeInstanceOf(Function);
   });
 });
+
+describe("card input values on actions", () => {
+  class ActionTestAdapter extends TeamsAdapter {
+    submitAsMessage(activity: unknown, data: Record<string, unknown>): void {
+      this.handleMessageAction(activity as never, data as never);
+    }
+
+    submitAsInvoke(activity: unknown): Promise<void> {
+      return this.handleAdaptiveCardAction({ activity } as never);
+    }
+  }
+
+  const activity = {
+    conversation: { conversationType: "personal", id: "19:abc" },
+    from: { id: "29:user", name: "Ada" },
+    id: "act-1",
+    serviceUrl: TEST_SERVICE_URL,
+  };
+
+  async function createAdapter() {
+    const chat = createMockChatInstance();
+    const adapter = new ActionTestAdapter({
+      appId: "test",
+      appPassword: "test",
+      logger,
+    });
+    await adapter.initialize(chat);
+    return { adapter, chat };
+  }
+
+  const lastAction = (chat: ReturnType<typeof createMockChatInstance>) =>
+    (chat.processAction as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+
+  it("reports the card's inputs on an Action.Submit message", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    adapter.submitAsMessage(activity, {
+      actionId: "approve",
+      value: "plan-1",
+      notes: "ship it",
+      priority: 2,
+    });
+
+    const action = lastAction(chat);
+    expect(action).toMatchObject({ actionId: "approve", value: "plan-1" });
+    // Exact: toMatchObject would let the adapter's own keys leak in as inputs.
+    expect(action.values).toEqual({ notes: "ship it", priority: "2" });
+  });
+
+  it("reports the card's inputs on an adaptive card invoke", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    await adapter.submitAsInvoke({
+      ...activity,
+      value: { action: { data: { actionId: "approve", notes: "ship it" } } },
+    });
+
+    expect(lastAction(chat)).toMatchObject({
+      actionId: "approve",
+      values: { notes: "ship it" },
+    });
+  });
+
+  it("leaves values absent when the card has no inputs", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    adapter.submitAsMessage(activity, {
+      actionId: "approve",
+      value: "plan-1",
+      msteams: { type: "task/fetch" },
+    });
+
+    expect(lastAction(chat).values).toBeUndefined();
+  });
+
+  it("delivers an auto-submit input named value, which only a button reserves", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    // The auto-injected submit carries no button value, so `value` here can
+    // only be a card input.
+    adapter.submitAsMessage(activity, {
+      actionId: "__auto_submit",
+      value: "opt-1",
+      priority: 2,
+    });
+
+    const events = (
+      chat.processAction as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.map(([event]) => event);
+    expect(events).toHaveLength(2);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ actionId: "value", value: "opt-1" }),
+        expect.objectContaining({ actionId: "priority", value: "2" }),
+      ])
+    );
+    for (const event of events) {
+      expect(event.values).toEqual({ value: "opt-1", priority: "2" });
+    }
+  });
+
+  it("reads a button click's inputs without taking the button's value as one", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    adapter.submitAsMessage(activity, {
+      actionId: "approve",
+      value: "plan-1",
+      notes: "ship it",
+    });
+
+    const action = lastAction(chat);
+    expect(action.value).toBe("plan-1");
+    expect(action.values).toEqual({ notes: "ship it" });
+  });
+
+  it("keeps only string and number input values", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    adapter.submitAsMessage(activity, {
+      actionId: "approve",
+      notes: "ship it",
+      priority: 2,
+      toggle: true,
+      cleared: null,
+      tags: ["a"],
+    });
+
+    expect(lastAction(chat).values).toEqual({
+      notes: "ship it",
+      priority: "2",
+    });
+  });
+
+  it("gives every fanned-out auto-submit action the whole form", async () => {
+    const { adapter, chat } = await createAdapter();
+
+    adapter.submitAsMessage(activity, {
+      actionId: "__auto_submit",
+      notes: "ship it",
+      severity: "high",
+    });
+
+    const calls = (chat.processAction as unknown as ReturnType<typeof vi.fn>)
+      .mock.calls;
+    expect(calls).toHaveLength(2);
+    for (const [event] of calls) {
+      expect(event.values).toEqual({ notes: "ship it", severity: "high" });
+    }
+  });
+});

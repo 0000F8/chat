@@ -69,7 +69,14 @@ import {
   type TeamsActivityAttachment,
 } from "./attachments";
 import { BridgeHttpAdapter } from "./bridge-adapter";
-import { AUTO_SUBMIT_ACTION_ID, cardToAdaptiveCard } from "./cards";
+import {
+  AUTO_SUBMIT_ACTION_ID,
+  AUTO_SUBMIT_KEYS,
+  BUTTON_SUBMIT_KEYS,
+  cardInputValues,
+  cardToAdaptiveCard,
+  submitValueToString,
+} from "./cards";
 import { toAppOptions } from "./config";
 import { handleTeamsError } from "./errors";
 import { TeamsGraphReader } from "./graph-api";
@@ -95,7 +102,12 @@ import type {
   TeamsThreadId,
 } from "./types";
 
-/** Data payload from an Action.Submit button click. */
+/**
+ * Data payload from an Action.Submit button click. Teams merges the card's own
+ * input values into the same flat object, so it carries more keys than this
+ * names; `cardInputValues` in `cards.ts` reads those. Kept free of an index signature so a
+ * misspelled member read stays a compile error rather than `unknown`.
+ */
 interface ActionSubmitData {
   actionId?: string;
   value?: string;
@@ -640,11 +652,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
 
     // Auto-submit fan-out: fire onAction for each input value
     if (actionValue.actionId === AUTO_SUBMIT_ACTION_ID) {
-      this.fanOutAutoSubmit(
-        actionValue as unknown as Record<string, unknown>,
-        activity,
-        threadId
-      );
+      this.fanOutAutoSubmit(actionValue, activity, threadId);
       return;
     }
 
@@ -653,6 +661,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     } = {
       actionId: actionValue.actionId,
       value: actionValue.value,
+      values: cardInputValues(actionValue, BUTTON_SUBMIT_KEYS),
       user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
@@ -697,8 +706,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
 
     // Auto-submit fan-out: fire onAction for each input value
     if (actionData.actionId === AUTO_SUBMIT_ACTION_ID) {
-      const rawPayload = activity.value.action.data as Record<string, unknown>;
-      this.fanOutAutoSubmit(rawPayload, activity, threadId);
+      this.fanOutAutoSubmit(actionData, activity, threadId);
       return;
     }
 
@@ -707,6 +715,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     } = {
       actionId: actionData.actionId,
       value: actionData.value,
+      values: cardInputValues(actionData, BUTTON_SUBMIT_KEYS),
       user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
@@ -733,7 +742,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
    * Each input key/value pair is dispatched as a separate action in parallel.
    */
   protected fanOutAutoSubmit(
-    payload: Record<string, unknown>,
+    payload: object,
     activity: Activity,
     threadId: string
   ): void {
@@ -742,8 +751,8 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     }
 
     const webhookOptions = this.bridgeAdapter.getWebhookOptions(activity.id);
-    const entries = Object.entries(payload).filter(
-      ([key]) => key !== "actionId" && key !== "msteams"
+    const entries = (Object.entries(payload) as [string, unknown][]).filter(
+      ([key]) => !AUTO_SUBMIT_KEYS.has(key)
     );
 
     this.logger.debug("Auto-submit fan-out", {
@@ -757,6 +766,8 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
       threadId,
       adapter: this as TeamsAdapter,
       raw: activity,
+      // Every fanned-out action reports the whole form, not just its own input.
+      values: cardInputValues(payload, AUTO_SUBMIT_KEYS),
     };
 
     for (const [key, val] of entries) {
@@ -764,7 +775,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
         {
           ...baseEvent,
           actionId: key,
-          value: typeof val === "string" ? val : undefined,
+          value: submitValueToString(val),
         },
         webhookOptions
       );
@@ -803,6 +814,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     } = {
       actionId: actionData.actionId || "dialog.open",
       value: actionData.value,
+      values: cardInputValues(actionData, BUTTON_SUBMIT_KEYS),
       user: this.authorFromActivity(activity),
       messageId: activity.replyToId || activity.id || "",
       threadId,
