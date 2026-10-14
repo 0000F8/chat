@@ -305,6 +305,7 @@ import type {
   SlackFeedbackButtonsOptions,
   SlackInstallation,
   SlackSessionTitle,
+  SlackStreamResult,
   SlackSuggestedPrompts,
   SlackSuggestedPromptsContext,
 } from "./types";
@@ -320,6 +321,16 @@ const DEFAULT_STREAM_SEGMENT_MAX_AGE_MS = 240_000;
 const STREAM_SEGMENT_ROTATION_GRACE_MS = 30_000;
 /** Slack's error for appending to or stopping a stream it already expired. */
 const STREAM_EXPIRED_ERROR = "message_not_in_streaming_state";
+/**
+ * Slack errors that don't prove a call was rejected: the call may still
+ * have been applied, so retrying it could deliver its content twice.
+ */
+const MAYBE_APPLIED_ERRORS = new Set([
+  "fatal_error",
+  "internal_error",
+  "request_timeout",
+  "service_unavailable",
+]);
 /** Fenced code block delimiter: up to three spaces, then 3+ backticks or tildes. */
 const FENCE_LINE_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const TABLE_ROW_PATTERN = /^\|.*\|$/;
@@ -439,6 +450,7 @@ export type {
   SlackInstallation,
   SlackSessionTitle,
   SlackSessionTitleContext,
+  SlackStreamResult,
   SlackSuggestedPrompt,
   SlackSuggestedPrompts,
   SlackSuggestedPromptsContext,
@@ -5944,7 +5956,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
    * Slack expires a native stream after roughly five minutes, so a reply
    * that streams longer than `streamSegmentMaxAgeMs` is finalized and
    * continued in a new message. The returned `id` is the last message of
-   * the reply; earlier segments are already final and are not tracked.
+   * the reply, and `messageIds` lists every message of the reply in order.
    *
    * Falls back to post-and-edit when the thread lacks native stream context.
    */
@@ -5952,7 +5964,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     threadId: string,
     textStream: AsyncIterable<string | StreamChunk>,
     options?: StreamOptions
-  ): Promise<RawMessage<unknown> | null> {
+  ): Promise<SlackStreamResult | null> {
     const { channel, threadTs: rawThreadTs } = this.decodeThreadId(threadId);
     const threadTs = rawThreadTs || undefined;
     if (!threadTs) {
@@ -6027,6 +6039,15 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       tableHeader: "",
     };
     let rotations = 0;
+    /** Message IDs of the segments finalized so far, in order. */
+    const finalizedMessageIds: string[] = [];
+    const toStreamResult = (
+      message: RawMessage<unknown> | null
+    ): SlackStreamResult | null =>
+      message && {
+        ...message,
+        messageIds: [...finalizedMessageIds, message.id],
+      };
 
     /** Prefix of `resolvedCommitted` handed to the current segment's streamer. */
     let lastAppended = "";
@@ -6231,6 +6252,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
      * text (see `withSegmentPrefix`) rather than sent on its own.
      */
     const startNextSegment = async (sent: string): Promise<void> => {
+      // A segment that expired before Slack accepted any call has no message.
+      if (segment.streamer.ts) {
+        finalizedMessageIds.push(segment.streamer.ts);
+      }
       segment.streamer = createStreamer();
       segment.startedAt = undefined;
       segment.flushNextAppend = true;
@@ -6303,16 +6328,45 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       const finalText =
         (head.length > 0 ? withSegmentPrefix(head) : "") + closer;
       const ageMs = segmentAgeMs();
+      const closingTaskChunks =
+        structuredChunksSupported && openTasks.size > 0
+          ? Array.from(openTasks.values(), (task) => ({
+              ...task,
+              status: "complete" as const,
+            }))
+          : undefined;
+      // Keep the agent session marked busy: the reply continues in the next
+      // segment, and chat.stopStream defaults to "active".
+      const sessionArgs: { session_status?: AgentSessionStatus } = this
+        .agentView
+        ? { session_status: "processing" }
+        : {};
       try {
-        const result = await segment.streamer.stop({
-          token,
-          ...(finalText.length > 0 ? { markdown_text: finalText } : {}),
-          // Keep the agent session marked busy: the reply continues in the
-          // next segment, and chat.stopStream defaults to "active".
-          ...(this.agentView ? { session_status: "processing" } : {}),
-        } as ChatStopStreamArguments & {
-          session_status?: AgentSessionStatus;
-        });
+        let result: Awaited<ReturnType<typeof segment.streamer.stop>>;
+        try {
+          result = await segment.streamer.stop({
+            token,
+            ...(finalText.length > 0 ? { markdown_text: finalText } : {}),
+            chunks: closingTaskChunks as ChatStopStreamArguments["chunks"],
+            ...sessionArgs,
+          } as ChatStopStreamArguments);
+        } catch (error) {
+          const platformError = slackPlatformErrorCode(error);
+          if (
+            !(closingTaskChunks && platformError) ||
+            platformError === STREAM_EXPIRED_ERROR ||
+            MAYBE_APPLIED_ERRORS.has(platformError)
+          ) {
+            throw error;
+          }
+          // Slack rejected the call, so the streamer still holds finalText
+          // in its buffer; the retry sends it without the task chunks.
+          result = await segment.streamer.stop({
+            token,
+            ...sessionArgs,
+          } as ChatStopStreamArguments);
+          disableStructuredChunks("task_update", error);
+        }
         lastFlushed = sent;
         this.logger.debug("Slack: rotated stream segment", {
           channel,
@@ -6464,7 +6518,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         messageId: fallback.message?.id,
       });
       await this.endTyping(threadId, options?.sessionStatus ?? "active");
-      return fallback.message;
+      return toStreamResult(fallback.message);
     }
 
     // Caller blocks (StreamingPlan endWith) first, then the configured
@@ -6501,7 +6555,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
           messageId: fallback.message?.id,
         });
         await this.endTyping(threadId, options?.sessionStatus ?? "active");
-        return fallback.message;
+        return toStreamResult(fallback.message);
       }
       if (!isStreamExpired(error)) {
         throw error;
@@ -6526,7 +6580,11 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
           }
         );
         await this.endTyping(threadId, options?.sessionStatus ?? "active");
-        return { id: expiredTs, threadId, raw: { ts: expiredTs } };
+        return toStreamResult({
+          id: expiredTs,
+          threadId,
+          raw: { ts: expiredTs },
+        });
       }
       this.logger.warn(
         "Slack: stream expired before stop, delivering the rest in a new message",
@@ -6540,18 +6598,20 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         markdown_text: withSegmentPrefix(unconfirmed),
       });
     }
-    const messageTs = (result.message?.ts ?? result.ts) as string;
+    const messageTs = (result.message?.ts ??
+      result.ts ??
+      segment.streamer.ts) as string;
 
     this.logger.debug("Slack: stream complete", {
       messageId: messageTs,
       segments: rotations + 1,
     });
 
-    return {
+    return toStreamResult({
       id: messageTs,
       threadId,
       raw: result,
-    };
+    });
   }
 
   /**
