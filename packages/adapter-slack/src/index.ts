@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   AdapterRateLimitError,
   type AttachmentTransport,
@@ -1647,6 +1647,26 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     throw new AuthenticationError(
       "slack",
       "No bot token available. In multi-workspace mode, ensure the webhook is being processed."
+    );
+  }
+
+  getConcurrencyScope(): string | undefined {
+    if (this.defaultBotTokenProvider) {
+      return undefined;
+    }
+    const context = this.requestContext.getStore();
+    if (context?.installationId) {
+      return JSON.stringify(["installation", context.installationId]);
+    }
+    if (context?.token) {
+      return JSON.stringify([
+        "token",
+        createHash("sha256").update(context.token).digest("hex"),
+      ]);
+    }
+    throw new AuthenticationError(
+      "slack",
+      "No installation context available. Process a verified webhook or use withBotToken with installationId before handling messages or cancelling turns."
     );
   }
 
