@@ -1109,35 +1109,140 @@ function attachmentContent(
   return { blocks, parts, tables };
 }
 
+/** One piece of a layout block body, in block order. */
+type SlackBodyItem = SlackAttachmentPart | { table: SlackTableData };
+
+/**
+ * Block types `layoutBlockBody` can render. `divider` and `actions` carry no
+ * body text; `actions` is interactive only, which `cardToFallbackText` mirrors
+ * by leaving buttons out of the fallback.
+ */
+const LAYOUT_BLOCK_TYPES = new Set([
+  "actions",
+  "context",
+  "divider",
+  "header",
+  "image",
+  "section",
+  ...TABLE_BLOCK_TYPES,
+]);
+
+/**
+ * The body of a message composed from Block Kit layout blocks, typically by
+ * an app or workflow. When a message carries blocks, Slack renders them and
+ * uses `text` only as the notification fallback, so the fallback can omit
+ * content the blocks show.
+ *
+ * Text in `section` (including `fields`), `header`, and `context` blocks and
+ * the visible `title` of `image` blocks become the body in block order, with
+ * tables in place: `mrkdwn` objects keep their markup and `plain_text` objects
+ * render literally.
+ *
+ * Returns `null`, leaving `text` as the body, when any block is outside
+ * `LAYOUT_BLOCK_TYPES` or the blocks carry no text. Content the parser can't
+ * render then still reaches the message through the fallback. Messages typed
+ * in a Slack client carry `rich_text` blocks, which `text` mirrors, so they
+ * take this path too.
+ */
+function layoutBlockBody(event: SlackEvent): SlackBodyItem[] | null {
+  const blocks = event.blocks ?? [];
+  if (!blocks.every((block) => LAYOUT_BLOCK_TYPES.has(block.type))) {
+    return null;
+  }
+
+  const items: SlackBodyItem[] = [];
+  const push = (object: unknown) => {
+    if (!isRecord(object) || typeof object.text !== "string") {
+      return;
+    }
+    const text = object.text.trim();
+    if (!text) {
+      return;
+    }
+    if (object.type === "mrkdwn") {
+      items.push({ mrkdwn: text });
+    } else if (object.type === "plain_text") {
+      items.push({ literal: escapeSlackText(text) });
+    }
+  };
+  const pushEach = (objects: unknown) => {
+    if (Array.isArray(objects)) {
+      for (const object of objects) {
+        push(object);
+      }
+    }
+  };
+
+  for (const block of blocks) {
+    if (block.type === "section") {
+      push(block.text);
+      pushEach(block.fields);
+    } else if (block.type === "header") {
+      push(block.text);
+    } else if (block.type === "context") {
+      pushEach(block.elements);
+    } else if (block.type === "image") {
+      push(block.title);
+    } else {
+      const table = tableData(block);
+      if (table) {
+        items.push({ table });
+      }
+    }
+  }
+
+  return items.some((item) => !("table" in item)) ? items : null;
+}
+
 function mentionIds(
-  tables: SlackEventTables,
-  attachments: SlackAttachmentContent[]
+  tables: SlackTableData[],
+  parts: SlackAttachmentPart[]
 ): { channelIds: Set<string>; userIds: Set<string> } {
   const userIds = new Set<string>();
   const channelIds = new Set<string>();
-  const scan = (data: SlackTableData) => {
+  for (const data of tables) {
     for (const row of data.rows) {
       for (const cell of row) {
         collectMentionIds(cell, userIds, channelIds);
       }
     }
-  };
-  for (const data of [...tables.leading, ...tables.trailing]) {
-    scan(data);
   }
-  for (const attachment of attachments) {
-    for (const data of attachment.tables) {
-      scan(data);
-    }
-    for (const part of attachment.parts) {
-      collectMentionIds(
-        "mrkdwn" in part ? part.mrkdwn : part.literal,
-        userIds,
-        channelIds
-      );
-    }
+  for (const part of parts) {
+    collectMentionIds(
+      "mrkdwn" in part ? part.mrkdwn : part.literal,
+      userIds,
+      channelIds
+    );
   }
   return { channelIds, userIds };
+}
+
+/**
+ * Render plain-text Slack content to paragraphs. Lines share a paragraph,
+ * separated by hard breaks, and a blank line starts a new paragraph.
+ */
+function literalParagraphs(literal: string): SlackContentNode[] {
+  const paragraphs: SlackContentNode[] = [];
+  let children: SlackPhrasing[] = [];
+  const flush = () => {
+    if (children.length > 0) {
+      paragraphs.push({ type: "paragraph", children });
+      children = [];
+    }
+  };
+
+  for (const line of literal.split("\n")) {
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+    if (children.length > 0) {
+      children.push({ type: "break" });
+    }
+    children.push(...literalPhrasing(line));
+  }
+  flush();
+  return paragraphs;
 }
 
 /**
@@ -4572,7 +4677,8 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   /**
    * Extract link URLs from a Slack event.
    * Uses the `blocks` field (rich_text blocks with link elements) when available,
-   * falling back to parsing `<url>` patterns from the text field.
+   * falling back to parsing `<url>` patterns from the body's mrkdwn: layout
+   * block text when it forms the body, otherwise the text field.
    */
   protected extractLinks(event: SlackEvent): LinkPreview[] {
     const urls = new Set<string>();
@@ -4594,12 +4700,19 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       }
     }
 
-    // Fallback: parse <url> and <url|label> from text
-    if (urls.size === 0 && event.text) {
-      for (const match of event.text.matchAll(BRACKETED_URL_PATTERN)) {
-        const raw = match[1] as string;
-        const pipeIdx = raw.indexOf("|");
-        urls.add(pipeIdx >= 0 ? raw.slice(0, pipeIdx) : raw);
+    // Fallback: parse <url> and <url|label> from the mrkdwn the body renders,
+    // which is the layout block text when it replaces `text`
+    if (urls.size === 0) {
+      const body = layoutBlockBody(event);
+      const sources = body
+        ? body.flatMap((item) => ("mrkdwn" in item ? [item.mrkdwn] : []))
+        : [event.text ?? ""];
+      for (const source of sources) {
+        for (const match of source.matchAll(BRACKETED_URL_PATTERN)) {
+          const raw = match[1] as string;
+          const pipeIdx = raw.indexOf("|");
+          urls.add(pipeIdx >= 0 ? raw.slice(0, pipeIdx) : raw);
+        }
       }
     }
 
@@ -4794,9 +4907,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     const attachments = authorAttachments(event).map(attachmentContent);
     const isMention = this.detectSelfMention(event, rawText, attachments);
 
-    // Resolve inline @mentions to display names.
-    const text = await this.resolveInlineMentions(rawText);
-    const formatted = await this.resolvedContent(event, text, attachments);
+    const formatted = await this.resolvedContent(event, rawText, attachments);
 
     return new Message({
       id: event.ts || "",
@@ -7171,29 +7282,43 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     text: string,
     attachments = authorAttachments(event).map(attachmentContent)
   ): FormattedContent {
+    const body = layoutBlockBody(event);
     return this.assembleContent(
-      text,
-      eventTables(event),
+      body ? this.bodyNodes(body) : this.textNodes(text, eventTables(event)),
       attachments.flatMap((attachment) => this.attachmentNodes(attachment))
     );
   }
 
   /**
-   * Like `content`, but resolves user and channel mentions inside table
-   * cells and attachment content the same way `resolveInlineMentions`
-   * resolves them in body text. All mention IDs are collected up front and
-   * looked up in a single parallel wave so no ID is fetched twice.
+   * Like `content`, but resolves user and channel mentions in `rawText` with
+   * `resolveInlineMentions`, and inside table cells, layout block text, and
+   * attachment content the same way. Mention IDs outside `rawText` are
+   * collected up front and looked up in a single parallel wave so no ID is
+   * fetched twice.
    */
   protected async resolvedContent(
     event: SlackEvent,
-    text: string,
+    rawText: string,
     attachments = authorAttachments(event).map(attachmentContent)
   ): Promise<FormattedContent> {
-    const { leading, trailing } = eventTables(event);
-    const { channelIds, userIds } = mentionIds(
-      { leading, trailing },
-      attachments
-    );
+    const body = layoutBlockBody(event);
+    const { leading, trailing } = body
+      ? { leading: [], trailing: [] }
+      : eventTables(event);
+    const tables = [...leading, ...trailing];
+    const parts: SlackAttachmentPart[] = [];
+    for (const item of body ?? []) {
+      if ("table" in item) {
+        tables.push(item.table);
+      } else {
+        parts.push(item);
+      }
+    }
+    for (const attachment of attachments) {
+      tables.push(...attachment.tables);
+      parts.push(...attachment.parts);
+    }
+    const { channelIds, userIds } = mentionIds(tables, parts);
     const names = await this.lookupMentionNames(userIds, channelIds);
 
     const resolveTable = (data: SlackTableData): SlackTableData => ({
@@ -7208,11 +7333,18 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         : { literal: applyMentionNames(part.literal, names) };
 
     return this.assembleContent(
-      text,
-      {
-        leading: leading.map(resolveTable),
-        trailing: trailing.map(resolveTable),
-      },
+      body
+        ? this.bodyNodes(
+            body.map((item) =>
+              "table" in item
+                ? { table: resolveTable(item.table) }
+                : resolvePart(item)
+            )
+          )
+        : this.textNodes(await this.resolveInlineMentions(rawText), {
+            leading: leading.map(resolveTable),
+            trailing: trailing.map(resolveTable),
+          }),
       attachments.flatMap((attachment) =>
         this.attachmentNodes({
           ...attachment,
@@ -7224,19 +7356,38 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   }
 
   private assembleContent(
-    text: string,
-    tables: SlackEventTables,
-    attachments: SlackContentNode[] = []
+    body: SlackContentNode[],
+    attachments: SlackContentNode[]
   ): FormattedContent {
-    const formatted = this.formatConverter.toAst(text);
-    formatted.children.unshift(
-      ...tables.leading.map((data) => this.tableNode(data))
-    );
-    formatted.children.push(
-      ...tables.trailing.map((data) => this.tableNode(data))
-    );
-    formatted.children.push(...attachments);
-    return formatted;
+    return { type: "root", children: [...body, ...attachments] };
+  }
+
+  /** Render `text` as the message body, between its leading and trailing tables. */
+  private textNodes(
+    text: string,
+    tables: SlackEventTables
+  ): SlackContentNode[] {
+    return [
+      ...tables.leading.map((data) => this.tableNode(data)),
+      ...this.formatConverter.toAst(text).children,
+      ...tables.trailing.map((data) => this.tableNode(data)),
+    ];
+  }
+
+  /**
+   * Render a layout block body. Each text object becomes its own block, the
+   * way Slack lays out headers, fields, and context elements separately.
+   */
+  private bodyNodes(items: SlackBodyItem[]): SlackContentNode[] {
+    return items.flatMap((item): SlackContentNode[] => {
+      if ("table" in item) {
+        return [this.tableNode(item.table)];
+      }
+      if ("mrkdwn" in item) {
+        return this.formatConverter.toAst(item.mrkdwn).children;
+      }
+      return literalParagraphs(item.literal);
+    });
   }
 
   /**
@@ -7249,20 +7400,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
    */
   private attachmentNodes(content: SlackAttachmentContent): SlackContentNode[] {
     const nodes: SlackContentNode[] = [];
-    let lines: SlackPhrasing[][] = [];
+    let literals: string[] = [];
     const flush = () => {
-      if (lines.length === 0) {
-        return;
-      }
-      const children: SlackPhrasing[] = [];
-      for (const line of lines) {
-        if (children.length > 0) {
-          children.push({ type: "break" });
-        }
-        children.push(...line);
-      }
-      nodes.push({ type: "paragraph", children });
-      lines = [];
+      nodes.push(...literalParagraphs(literals.join("\n")));
+      literals = [];
     };
 
     for (const part of content.parts) {
@@ -7270,14 +7411,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         flush();
         nodes.push(...this.formatConverter.toAst(part.mrkdwn).children);
       } else {
-        for (const line of part.literal.split("\n")) {
-          if (line.trim()) {
-            lines.push(literalPhrasing(line));
-          } else {
-            // A blank line inside a literal part starts a new paragraph
-            flush();
-          }
-        }
+        literals.push(part.literal);
       }
     }
     flush();

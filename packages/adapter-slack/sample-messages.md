@@ -111,3 +111,11 @@ The next `app_mention` was sent from a Slack client with a file attached (`uploa
   body: '{"token":"xAbCdEfGhIjKlMnOpQrStUvW","team_id":"T00FAKE00AA","api_app_id":"A00FAKEAPP01","event":{"type":"app_mention","user":"U00FAKEUSER1","ts":"1789700000.000100","client_msg_id":"7c2e9f4a-5b1d-4e8a-9f3c-6d2b1a0e8f71","text":"see `<@U00FAKEBOT01>` for setup","files":[{"id":"F00FAKEFILE1","mimetype":"image/png","filetype":"png","name":"screenshot.png"}],"upload":false,"team":"T00FAKE00AA","blocks":[{"type":"rich_text","block_id":"aB1cD","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"see "},{"type":"text","text":"@examplebot","style":{"code":true}},{"type":"text","text":" for setup"}]}]}],"channel":"C00FAKECHAN1","event_ts":"1789700000.000100"},"type":"event_callback","event_id":"Ev0AFILECODE1","event_time":1789700000,"authorizations":[{"enterprise_id":null,"team_id":"T00FAKE00AA","user_id":"U00FAKEBOT01","is_bot":true,"is_enterprise_install":false}],"is_ext_shared_channel":false}'
 }
 ```
+
+The next `app_mention` was posted through `chat.postMessage` with a `section` block and a separate fallback `text` (ids, timestamps, and text anonymized). Slack renders the block and fires `app_mention` for the token in its mrkdwn, although `text` has no token. The adapter classifies it as `isMention: true` and builds the message body from the block, so `message.text` is `@<bot name> please check the deploy`, not the fallback.
+
+```log
+[chat-sdk:slack] Slack webhook raw body {
+  body: '{"token":"xAbCdEfGhIjKlMnOpQrStUvW","team_id":"T00FAKE00AA","api_app_id":"A00FAKEAPP01","event":{"type":"app_mention","user":"U00FAKEUSER1","ts":"1789700000.000200","text":"New request","team":"T00FAKE00AA","blocks":[{"type":"section","block_id":"cD2eF","text":{"type":"mrkdwn","text":"<@U00FAKEBOT01> please check the deploy","verbatim":false}}],"channel":"C00FAKECHAN1","event_ts":"1789700000.000200"},"type":"event_callback","event_id":"Ev0ASECTION01","event_time":1789700000,"authorizations":[{"enterprise_id":null,"team_id":"T00FAKE00AA","user_id":"U00FAKEBOT01","is_bot":true,"is_enterprise_install":false}],"is_ext_shared_channel":false}'
+}
+```
